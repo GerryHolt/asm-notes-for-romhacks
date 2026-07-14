@@ -1,0 +1,266 @@
+;=======================================================================
+; Super Street Fighter II X (ssf2xjr1, Japan 940223)  -  MiSTer jtcps2 / Darksoft
+; Stage Select (v5) + Event Mode (v5)  --  ALL MODIFIED / ADDED CODE
+;
+; Motorola 68000 syntax. Addresses are 68k CPU addresses in the decrypted
+; program (opcodes are CPS2-encrypted in the actual ROM; data stored plain).
+; a5 = 0x00FF8000 (work-RAM base).  (d16,a5) = a5-relative variable.
+;
+; MRA <patch> offset = CPU address + 0x40  (44B header + 20B key = 0x40).
+; Chips: hooks live in sfxj.03c (0x00000-0x7FFFF); injected routines in
+;        sfxj.07 (in-chip 0x45800.. == CPU 0x245800..), a stretch of $FF filler.
+;
+; v5 change (this file): the stage lock's release logic is now event-mode aware
+; (see ROUTINE 1A). Everything else is byte-identical to the v4 build.
+;=======================================================================
+
+
+;-----------------------------------------------------------------------
+; RELEVANT RAM / VARIABLE MAP  (all a5-relative unless noted)
+;-----------------------------------------------------------------------
+; $004(a5)   seq4  - post-match main sub-sequence (4=continue, 8=defeat->gameover, A=gameover screen)
+; $008(a5)   seq8  - nested sub-sequence
+; $00C(a5)   seqc  - nested sub-sub-sequence
+; $00E(a5)   frame/countdown timer used by various sub-states
+; $07E(a5)   system input, this frame   (bit0=COIN1, bit1=COIN2, ...)
+; $07F(a5)   system input, previous frame
+; $2DA(a5)   CONTINUE service flag       (0 = OFF / event-mode, nonzero = ON)
+; $2E5(a5)   active-player mask          (1 = 1P game, 3 = 2P game)
+; $2F0(a5)   per-player "end-state busy" bitmask (bit0=P1, bit1=P2); cleared as each finishes
+; $7DC(a5)   P1 char-select participation flag (set when P1 picks; 0 in attract)
+; $BDC(a5)   P2 char-select participation flag
+; $C4E(a5)   versus stage index (== character index; no lookup table)
+; $C86(a5)   game-over screen "both finished" counter (reaches 2 when done)
+; $CD6(a5)   score accumulator (part of overwritten instr at 0xFAE6)
+; $DF0(a5)   score delta       (part of overwritten instr at 0xFAE6)
+; $2E96      LFSR RNG routine (needs D2 preserved; returns roll in D0)
+;
+; Player structs: P1 base $44E(a5), P2 base $84E(a5) (0x400 stride)
+;   $381(a4)  P1/P2 selector byte (0 = P1 side, nonzero = P2 side)
+;   $391(a4)  currently-highlighted character cursor (0..15)
+;   $81(a4)   char-select state byte tested by the stock coin handler
+;
+; Scratch bytes (verified free): -$80(a5), -$81(a5), -$82(a5)
+;   -$80(a5)  "armed" flag for stage-select
+;   -$81(a5)  chosen stage index (0xFE = sentinel -> random)
+;   -$82(a5)  solo-match debounce counter (normal-mode auto-unlock only)
+;=======================================================================
+
+
+
+;#######################################################################
+;#  FEATURE 1 : STAGE SELECT  (v5 - "True Versus Auto-Unlock",
+;#                             event-mode lock-hold fix)
+;#######################################################################
+
+;-----------------------------------------------------------------------
+; HOOK 1A  @ 0x0039A6  (in sfxj.03c)   -- into the stage-load routine
+;-----------------------------------------------------------------------
+; STOCK (6 bytes) that we replace:
+;   0039A6:  move.w  (a1,d0.w),$C4E(a5)     ; load stage index from fighter table
+; The overwritten instruction is replicated at the tail of the injected
+; routine (label 9: below), so nothing is lost.
+;
+; PATCHED:
+        jsr     $245800                    ; -> stage-select routine (HOOK 1A)
+;   (0039AC onward continues stock: tst.w $C4E(a5) / bpl ...)
+
+
+;-----------------------------------------------------------------------
+; HOOK 1B  @ 0x00E9B8  (in sfxj.03c)   -- into the char-select input poll
+;-----------------------------------------------------------------------
+; STOCK (6 bytes) replaced:
+;   00E9B8:  tst.b   $81(a4)                ; char-select state test
+;   00E9BC:  bne.b   $E9FE
+; Both are replicated inside the coin handler (label 2: / 3:).
+;
+; PATCHED:
+        jmp     $245880                    ; -> coin handler (HOOK 1B)
+
+
+;-----------------------------------------------------------------------
+; ROUTINE 1A  @ 0x245800  (in sfxj.07)   -- stage-select loader (102 bytes)
+;-----------------------------------------------------------------------
+; Called every time the game loads the versus stage index.
+;
+; Presence is read from the two char-select participation flags $7DC (P1)
+; and $BDC (P2), which are set once a side has joined and only clear in
+; attract / at the true session end.
+;
+;   - BOTH sides present  -> apply the lock (force chosen stage; 0xFE => RNG),
+;                            reset the debounce.
+;   - NEITHER side present -> release immediately (attract / session end).
+;   - Exactly ONE side present:
+;         * Event Mode ($2DA == 0):  HOLD the lock and keep forcing the stage.
+;              This is the v5 fix. At a match end the loser's flag drops while
+;              the winner's stays set; a quick press-start "continue" off the
+;              win-quote used to let the old 2-frame debounce disarm here, so
+;              the next match reverted to the stock (winner's) stage - very
+;              visible when locked on Thailand (Dictator's own stage). Holding
+;              through this window keeps the lock until BOTH sides are gone.
+;         * Normal Mode ($2DA != 0): original behaviour - tick the 2-frame
+;              debounce and auto-unlock (players re-lock via coin at the next
+;              char-select).
+;   - Otherwise fall through to the stock load (label 9).
+;
+stage_select:                              ; == 0x245800
+        tst.b   -$80(a5)                   ; armed?
+        beq.s   9f                         ;   no -> stock load
+        tst.b   $7DC(a5)                   ; P1 in?
+        bne.s   check_p2
+        tst.b   $BDC(a5)                   ; P1 out: is P2 in?
+        beq.s   8f                         ;   neither in (attract/session end) -> release
+check_p2:
+        tst.b   $7DC(a5)                   ; both-in test
+        beq.s   one_absent                 ;   only one side in
+        tst.b   $BDC(a5)
+        beq.s   one_absent                 ;   only one side in
+        ; --- true versus, both players in: apply the stage lock ---
+force:
+        clr.b   -$82(a5)                   ; reset debounce
+        move.w  d0,d2                       ; preserve D0 (fighter-table idx)
+        moveq   #0,d0
+        move.b  -$81(a5),d0                ; chosen stage index
+        cmpi.b  #$FE,d0                     ; sentinel => random?
+        bne.s   1f
+        jsr     $2E96                       ; roll LFSR RNG (result in D0)
+1:      andi.w  #$F,d0                       ; clamp 0..15
+        move.w  d0,$C4E(a5)                 ; write versus stage
+        move.w  d2,d0                        ; restore D0
+        rts
+one_absent:                                 ; exactly one side present
+        tst.b   $2DA(a5)                    ; continue flag: 0 = EVENT MODE
+        beq.s   force                       ;   event mode -> HOLD lock (no early release)
+        addq.b  #1,-$82(a5)                  ; normal mode -> tick 2-frame debounce
+        cmpi.b  #2,-$82(a5)
+        bge.s   8f                           ;   reached 2 -> auto-unlock
+        bra.s   9f
+8:      clr.b   -$82(a5)                     ; release lock
+        clr.b   -$80(a5)                     ; disarm
+9:      move.w  (a1,d0.w),$C4E(a5)          ; <-- replicated stock instruction
+        rts
+
+
+;-----------------------------------------------------------------------
+; ROUTINE 1B  @ 0x245880  (in sfxj.07)   -- coin handler (62 bytes)
+;-----------------------------------------------------------------------
+; Runs from the char-select input poll. Detects a newly-pressed coin for
+; the active side; if pressed while a character is highlighted, latch that
+; character's index as the chosen stage and arm the lock. Then replicate
+; the two stock instructions the hook (1B) overwrote and return to flow.
+;
+coin_handler:                              ; == 0x245880
+        move.b  $7F(a5),d0                  ; previous system input
+        not.b   d0
+        and.b   $7E(a5),d0                  ; edges: newly pressed this frame
+        move.w  #$01,d1                     ; COIN1 mask (P1)
+        tst.b   $381(a4)                    ; which side is active?
+        beq.s   1f
+        move.w  #$02,d1                     ; COIN2 mask (P2)
+1:      and.b   d1,d0                        ; this side's coin edge?
+        beq.s   2f                           ;   no coin -> skip latch
+        move.b  $391(a4),-$81(a5)           ; chosen stage = highlighted char idx
+        move.b  #$01,-$80(a5)               ; arm
+        clr.b   -$82(a5)                     ; clean debounce start
+2:      tst.b   $81(a4)                      ; <-- replicated stock instr #1
+        bne.s   3f                           ; <-- replicated stock branch
+        jmp     $E9BE                        ; back to stock fall-through path
+3:      jmp     $E9FE                        ; back to stock taken path
+
+
+
+;#######################################################################
+;#  FEATURE 2 : EVENT MODE  (v4 - force game-over after 2P matches)
+;#  Active only when service "Continue = OFF" ($2DA == 0).
+;#  (unchanged in v5)
+;#######################################################################
+
+;-----------------------------------------------------------------------
+; HOOK 2A  @ 0x00FAE6  (in sfxj.03c)   -- into the P1-win "continue" commit
+;-----------------------------------------------------------------------
+; This point is reached only by the one 2P outcome that would otherwise
+; continue: a P1 win. (A draw and a P2 win already route to game-over.)
+;
+; STOCK (first 6 bytes) replaced:
+;   00FAE6:  move.w  $CD6(a5),d0            ; score accumulate...
+;   00FAEA:  add.w   $DF0(a5),d0            ; (first 2 bytes of this insn)
+; Both are replicated in the routine (label 1:).
+;
+; PATCHED:
+        jmp     $245900                    ; -> event-mode decision (HOOK 2A)
+
+
+;-----------------------------------------------------------------------
+; HOOK 2B  @ 0x00E026  (in sfxj.03c)   -- the game-over-screen wait gate
+;-----------------------------------------------------------------------
+; Game-over screen (seq4=A) sub-state seq8=2 waits for $2F0 == 0, i.e. for
+; BOTH players' end-state to finish. When we force game-over on a 2P win,
+; the surviving winner's $2F0 bit never clears, so it would hang. This hook
+; lets the wait be skipped when Continue is OFF.
+;
+; STOCK (6 bytes) replaced:
+;   00E026:  tst.b   $2F0(a5)
+;   00E02A:  bne.b   $E030
+; The stock advance (addq #2,$8) at 00E02C and rts at 00E030 remain and are
+; re-used as jump targets by the stub.
+;
+; PATCHED:
+        jmp     $245930                    ; -> gate stub (HOOK 2B)
+
+
+;-----------------------------------------------------------------------
+; ROUTINE 2A  @ 0x245900  (in sfxj.07)   -- event-mode decision (34 bytes)
+;-----------------------------------------------------------------------
+; If Continue is OFF and this is a 2-player game, divert the P1-win
+; "continue" into the game's own game-over commit (0xFB28, which sets
+; seq4=8). Otherwise replicate the two overwritten score instructions and
+; drop back into the stock body at 0xFAEE.
+;
+event_decide:                              ; == 0x245900
+        tst.b   $2DA(a5)                    ; continue flag
+        bne.s   1f                           ;   ON  -> normal continue
+        cmpi.b  #$03,$2E5(a5)               ; 2-player game?
+        bne.s   1f                           ;   no  -> normal continue (1P safe)
+        jmp     $FB28                        ; OFF + 2P -> GAME OVER (seq4=8)
+1:      move.w  $CD6(a5),d0                 ; <-- replicated stock instr 1
+        add.w   $DF0(a5),d0                 ; <-- replicated stock instr 2
+        jmp     $FAEE                        ; back into stock 0xFAE6 body
+
+
+;-----------------------------------------------------------------------
+; ROUTINE 2B  @ 0x245930  (in sfxj.07)   -- game-over gate stub (24 bytes)
+;-----------------------------------------------------------------------
+; Replacement decision for the seq8=2 wait: when Continue is OFF, advance
+; regardless of $2F0 (don't wait on the surviving winner). When Continue is
+; ON, behave exactly like stock (advance only when $2F0 == 0).
+;
+gameover_gate:                             ; == 0x245930
+        tst.b   $2DA(a5)                    ; continue flag
+        beq.s   1f                           ;   OFF -> advance (skip wait)
+        tst.b   $2F0(a5)                    ;   ON  -> stock test
+        bne.s   2f                           ;     busy -> wait
+1:      jmp     $E02C                        ; advance: stock addq #2,$8(a5)
+2:      jmp     $E030                        ; wait:    stock rts
+
+
+;=======================================================================
+; SUMMARY OF PATCH SITES  (CPU addr -> MRA offset = addr + 0x40)
+;
+;   Feature 1 (Stage Select):
+;     0x0039A6  hook  jsr  $245800        (MRA 0x0039E6)
+;     0x00E9B8  hook  jmp  $245880        (MRA 0x00E9F8)
+;     0x245800  routine  stage_select     (MRA 0x245840)  102 bytes  <-- v5 (was 96)
+;     0x245880  routine  coin_handler     (MRA 0x2458C0)  62 bytes
+;
+;   Feature 2 (Event Mode):
+;     0x00FAE6  hook  jmp  $245900        (MRA 0x00FB26)
+;     0x00E026  hook  jmp  $245930        (MRA 0x00E066)
+;     0x245900  routine  event_decide     (MRA 0x245940)  34 bytes
+;     0x245930  routine  gameover_gate    (MRA 0x245970)  24 bytes
+;
+; Injected-routine layout in sfxj.07 (CPU 0x245800 block):
+;     0x245800 .. 0x245865   stage_select  (102 B)   <-- grew 6 B into $FF filler
+;     0x245880 .. 0x2458BD   coin_handler  (62 B)     (unchanged, 26 B gap before it)
+;     0x245900 .. 0x245921   event_decide  (34 B)
+;     0x245930 .. 0x245947   gameover_gate (24 B)
+;=======================================================================
