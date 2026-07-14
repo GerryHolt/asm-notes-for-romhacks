@@ -1,0 +1,142 @@
+; ============================================================
+; SF2' Hyper Fighting -- Stage Select + Event Mode (v8)
+; Translated from GNU GAS source to ASM68K syntax
+; a5 = 0xFF8000 (game global base, held live all the time)
+; ============================================================
+
+; ------------------------------------------------------------
+; HOOK SITES (patched over stock code -- 6 bytes each)
+; ------------------------------------------------------------
+;   CPU $001D2B0  stock: move.w  $7a(a5),$7c(a5)
+;                 patch: jsr     coin_handler   ($E5800)
+;
+;   CPU $0003D2   stock: move.w  (a1,d0.w),$9be(a5)
+;                 patch: jsr     stage_select   ($E5860)
+;
+;   CPU $0BB15A   stock: cmpi.b  #2,$2d5(a5)
+;                 patch: jsr     event_check_p1 ($E5880)
+;
+;   CPU $0BB17E   stock: cmpi.b  #1,$2d5(a5)
+;                 patch: jsr     event_check_p2 ($E58C0)
+; ------------------------------------------------------------
+
+
+; ------------------------------------------------------------
+; Free scratch RAM used (verified 0 in every state dumped):
+;   -$82(a5)  0xFF7F7E  arm flag (0/1)
+;   -$81(a5)  0xFF7F7F  locked stage index
+; ------------------------------------------------------------
+
+
+        ORG     $E5800
+
+; --------------------------------------------------------
+; coin_handler -- replaces the coin hook at CPU $1D2B0
+;
+; Every frame: if P2 is not in the game, force-disarm the
+; stage lock (auto-release). Otherwise, during character
+; select, watch for a fresh coin press and lock the stage
+; to whichever character is currently highlighted.
+; --------------------------------------------------------
+coin_handler:
+        movem.l d0-d1,-(sp)
+        btst    #1,$2e0(a5)         ; P2 currently joined?
+        bne.s   .check_charsel
+        clr.b   -$82(a5)            ; no -> disarm / release lock
+        bra.s   .exit
+.check_charsel:
+        cmpi.b  #$14,$21(a5)        ; on character-select screen?
+        bne.s   .exit
+        move.b  $72(a5),d0
+        move.b  $73(a5),d1
+        not.b   d1
+        and.b   d1,d0               ; d0 = newly-pressed buttons this frame
+        btst    #0,d0               ; Coin 1 pressed?
+        beq.s   .check_coin2
+        move.b  $64f(a5),-$81(a5)   ; lock stage = P1's highlighted char
+        move.b  #1,-$82(a5)         ; arm
+.check_coin2:
+        btst    #1,d0               ; Coin 2 pressed?
+        beq.s   .exit
+        move.b  $94f(a5),-$81(a5)   ; lock stage = P2's highlighted char
+        move.b  #1,-$82(a5)         ; arm
+.exit:
+        movem.l (sp)+,d0-d1
+        move.w  $7a(a5),$7c(a5)     ; replicate the overwritten stock instruction
+        rts
+
+
+        ORG     $E5860
+
+; --------------------------------------------------------
+; stage_select -- replaces the stage-decision write at CPU $3D2
+;
+; If armed, force the locked stage index. Otherwise fall
+; through to the stock character-indexed stage pick.
+; --------------------------------------------------------
+stage_select:
+        tst.b   -$82(a5)            ; armed?
+        beq.s   .stock_pick
+        move.l  d0,-(sp)
+        moveq   #0,d0
+        move.b  -$81(a5),d0         ; locked stage index
+        move.w  d0,$9be(a5)         ; force it
+        move.l  (sp)+,d0
+        rts
+.stock_pick:
+        move.w  (a1,d0.w),$9be(a5)  ; stock behavior, untouched
+        rts
+
+
+        ORG     $E5880
+
+; --------------------------------------------------------
+; event_check_p1 -- replaces cmpi.b #2,$2d5(a5) at CPU $BB15A
+;
+; Contract: must return with the Z flag set/clear exactly
+; as the stock compare would, UNLESS Allow Continue is OFF
+; and this was a 2-player match, in which case Z is forced
+; set (take the game-over path) and the winning player (P1)
+; is retired through the game's own removal state so the
+; native game-over sequence runs to completion.
+; --------------------------------------------------------
+event_check_p1:
+        btst    #6,$88(a5)          ; DSWC bit 6: set = Allow Continue Yes
+        beq.s   .p1_event
+        cmpi.b  #2,$2d5(a5)         ; Allow Continue ON -> fully stock compare
+        rts
+.p1_event:
+        cmpi.b  #2,$2d5(a5)         ; solo P2-side loss -> stock game over (Z set)
+        beq.s   .p1_done
+        cmpi.b  #3,$2d5(a5)         ; was this a 2-player match?
+        bne.s   .p1_done            ; no -> Z clear, normal "keep playing" path
+        bclr    #0,$2e0(a5)         ; retire P1 (the winner) from the join mask
+        clr.w   $640(a5)            ; clear P1 struct sub-state -> removed
+        cmpi.b  #3,$2d5(a5)         ; re-assert -> Z set for caller: game over
+.p1_done:
+        rts
+
+
+        ORG     $E58C0
+
+; --------------------------------------------------------
+; event_check_p2 -- replaces cmpi.b #1,$2d5(a5) at CPU $BB17E
+; Mirror of event_check_p1 for the P2-side resolution.
+; --------------------------------------------------------
+event_check_p2:
+        btst    #6,$88(a5)
+        beq.s   .p2_event
+        cmpi.b  #1,$2d5(a5)
+        rts
+.p2_event:
+        cmpi.b  #1,$2d5(a5)         ; solo P1-side loss -> stock game over
+        beq.s   .p2_done
+        cmpi.b  #3,$2d5(a5)
+        bne.s   .p2_done
+        bclr    #1,$2e0(a5)         ; retire P2 (the winner) from the join mask
+        clr.w   $940(a5)            ; clear P2 struct sub-state -> removed
+        cmpi.b  #3,$2d5(a5)
+.p2_done:
+        rts
+
+        END
